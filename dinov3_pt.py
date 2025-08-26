@@ -1,7 +1,8 @@
 import dataclasses
 import functools
+import math
+import pathlib
 import typing as tp
-from collections.abc import Callable
 
 import beartype
 import einops
@@ -133,14 +134,14 @@ class RopePositionEmbedding(nn.Module):
         embed_dim: int,
         *,
         num_heads: int,
-        base: float | None = 100.0,
-        min_period: float | None = None,
-        max_period: float | None = None,
-        normalize_coords: tp.Literal["min", "max", "separate"] = "separate",
+        base: float | None,
+        min_period: float | None,
+        max_period: float | None,
+        normalize_coords: tp.Literal["min", "max", "separate"],
         dtype: torch.dtype | None = None,
-        device: torch.device | None = None,
     ):
         super().__init__()
+
         assert embed_dim % (4 * num_heads) == 0
         both_periods = min_period is not None and max_period is not None
         if (base is None and not both_periods) or (base is not None and both_periods):
@@ -148,39 +149,49 @@ class RopePositionEmbedding(nn.Module):
                 "Either `base` or `min_period`+`max_period` must be provided."
             )
 
-        D_head = embed_dim // num_heads
         self.base = base
         self.min_period = min_period
         self.max_period = max_period
-        self.D_head = D_head
+        self.d_head = embed_dim // num_heads
         self.normalize_coords = normalize_coords
+        self.dtype = dtype
 
         # Needs persistent=True because we do teacher.load_state_dict(student.state_dict()) to initialize the teacher
-        self.dtype = dtype  # Don't rely on self.periods.dtype
         self.register_buffer(
-            "periods",
-            torch.empty(D_head // 4, device=device, dtype=dtype),
-            persistent=True,
+            "periods", torch.empty(self.d_head // 4, dtype=dtype), persistent=True
         )
-        self._init_weights()
+        dd = {"device": self.periods.device, "dtype": self.dtype}
+        dtype = self.dtype
+        if self.base is not None:
+            periods = self.base ** (
+                2 * torch.arange(self.d_head // 4, **dd) / (self.d_head // 2)
+            )  # [D//4]
+        else:
+            base = self.max_period / self.min_period
+            exponents = torch.linspace(0, 1, self.d_head // 4, **dd)
+            periods = base**exponents  # range [1, max_period / min_period]
+            periods = periods / base  # range [min_period / max_period, 1]
+            periods = periods * self.max_period  # range [min_period, max_period]
 
-    def forward(self, *, H: int, W: int) -> tuple[Tensor, Tensor]:
+        self.periods.data = periods
+
+    def forward(self, *, h: int, w: int) -> tuple[Tensor, Tensor]:
         device = self.periods.device
         dtype = self.dtype
         dd = {"device": device, "dtype": dtype}
 
         # Prepare coords in range [-1, +1]
         if self.normalize_coords == "max":
-            max_HW = max(H, W)
-            coords_h = torch.arange(0.5, H, **dd) / max_HW  # [H]
-            coords_w = torch.arange(0.5, W, **dd) / max_HW  # [W]
+            max_hw = max(h, w)
+            coords_h = torch.arange(0.5, h, **dd) / max_hw  # [h]
+            coords_w = torch.arange(0.5, w, **dd) / max_hw  # [w]
         elif self.normalize_coords == "min":
-            min_HW = min(H, W)
-            coords_h = torch.arange(0.5, H, **dd) / min_HW  # [H]
-            coords_w = torch.arange(0.5, W, **dd) / min_HW  # [W]
+            min_hw = min(h, w)
+            coords_h = torch.arange(0.5, h, **dd) / min_hw  # [h]
+            coords_w = torch.arange(0.5, w, **dd) / min_hw  # [w]
         elif self.normalize_coords == "separate":
-            coords_h = torch.arange(0.5, H, **dd) / H  # [H]
-            coords_w = torch.arange(0.5, W, **dd) / W  # [W]
+            coords_h = torch.arange(0.5, h, **dd) / h  # [h]
+            coords_w = torch.arange(0.5, w, **dd) / w  # [w]
         else:
             raise ValueError(f"Unknown normalize_coords: {self.normalize_coords}")
         coords = torch.stack(
@@ -200,39 +211,15 @@ class RopePositionEmbedding(nn.Module):
 
         return (sin, cos)  # 2 * [HW, D]
 
-    def _init_weights(self):
-        device = self.periods.device
-        dtype = self.dtype
-        if self.base is not None:
-            periods = self.base ** (
-                2
-                * torch.arange(self.D_head // 4, device=device, dtype=dtype)
-                / (self.D_head // 2)
-            )  # [D//4]
-        else:
-            base = self.max_period / self.min_period
-            exponents = torch.linspace(
-                0, 1, self.D_head // 4, device=device, dtype=dtype
-            )  # [D//4] range [0, 1]
-            periods = base**exponents  # range [1, max_period / min_period]
-            periods = periods / base  # range [min_period / max_period, 1]
-            periods = periods * self.max_period  # range [min_period, max_period]
-        self.periods.data = periods
 
+@jaxtyped(typechecker=beartype.beartype)
+class LayerScale(nn.Module):
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.gamma = nn.Parameter(torch.empty(dim))
 
-# RoPE-related functions:
-def rope_rotate_half(x: Tensor) -> Tensor:
-    # x:   [ x0  x1  x2  x3  x4  x5]
-    # out: [-x3 -x4 -x5  x0  x1  x2]
-    x1, x2 = x.chunk(2, dim=-1)
-    return torch.cat([-x2, x1], dim=-1)
-
-
-def rope_apply(x: Tensor, sin: Tensor, cos: Tensor) -> Tensor:
-    # x:   [..., D], eg [x0,     x1,   x2,   x3,   x4,   x5]
-    # sin: [..., D], eg [sin0, sin1, sin2, sin0, sin1, sin2]
-    # cos: [..., D], eg [cos0, cos1, cos2, cos0, cos1, cos2]
-    return (x * cos) + (rope_rotate_half(x) * sin)
+    def __call__(self, x: Float[Tensor, "..."]) -> Float[Tensor, "..."]:
+        return x * self.gamma
 
 
 class LinearKMaskedBias(nn.Linear):
@@ -252,32 +239,50 @@ class LinearKMaskedBias(nn.Linear):
         return F.linear(input, self.weight, masked_bias)
 
 
+@jaxtyped(typechecker=beartype.beartype)
+def _rotate_half(x: Float[Tensor, "..."]) -> Float[Tensor, "..."]:
+    # x:   [ x0  x1  x2  x3  x4  x5]
+    # out: [-x3 -x4 -x5  x0  x1  x2]
+    x1, x2 = x.chunk(2, dim=-1)
+    return torch.cat([-x2, x1], dim=-1)
+
+
+@jaxtyped(typechecker=beartype.beartype)
+def _rope(
+    x: Float[Tensor, "..."], sin: Float[Tensor, "..."], cos: Float[Tensor, "..."]
+) -> Float[Tensor, "..."]:
+    # x:   [..., D], eg [x0,     x1,   x2,   x3,   x4,   x5]
+    # sin: [..., D], eg [sin0, sin1, sin2, sin0, sin1, sin2]
+    # cos: [..., D], eg [cos0, cos1, cos2, cos0, cos1, cos2]
+    return (x * cos) + (_rotate_half(x) * sin)
+
+
+@jaxtyped(typechecker=beartype.beartype)
+def rope_fn(
+    q_nhd: Float[Tensor, "..."],
+    k_nhd: Float[Tensor, "..."],
+    rope_2pd: Float[Tensor, "..."],
+) -> tuple[Float[Tensor, "..."], Float[Tensor, "..."]]: ...
+
+
+@jaxtyped(typechecker=beartype.beartype)
 class SelfAttention(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        num_heads: int = 8,
-        qkv_bias: bool = False,
-        proj_bias: bool = True,
-        attn_drop: float = 0.0,
-        proj_drop: float = 0.0,
-        mask_k_bias: bool = False,
-        device=None,
-    ) -> None:
+    def __init__(self, cfg: Config):
         super().__init__()
-        self.num_heads = num_heads
-        head_dim = dim // num_heads
+        self.cfg = cfg
+        head_dim = cfg.embed_dim // cfg.num_heads
         self.scale = head_dim**-0.5
 
-        linear_class = LinearKMaskedBias if mask_k_bias else nn.Linear
-        self.qkv = linear_class(dim, dim * 3, bias=qkv_bias, device=device)
-        self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim, bias=proj_bias, device=device)
-        self.proj_drop = nn.Dropout(proj_drop)
+        linear_cls = LinearKMaskedBias if cfg.mask_k_bias else nn.Linear
+        self.qkv = linear_cls(cfg.embed_dim, cfg.embed_dim * 3, bias=cfg.qkv_bias)
+        self.proj = nn.Linear(cfg.embed_dim, cfg.embed_dim, bias=cfg.proj_bias)
 
     def apply_rope(
-        self, q: Tensor, k: Tensor, rope: Tensor | tuple[Tensor, Tensor]
-    ) -> tuple[Tensor, Tensor]:
+        self,
+        q_bhnd: Float[Tensor, "batch n_heads n d_head"],
+        k_bhnd: Float[Tensor, "batch n_heads n d_head"],
+        rope: Tensor | tuple[Tensor, Tensor],
+    ) -> tuple[Float[Tensor, "n n_heads d_head"], Float[Tensor, "n n_heads d_head"]]:
         # All operations will use the dtype of rope, the output is cast back to the dtype of q and k
         q_dtype = q.dtype
         k_dtype = k.dtype
@@ -298,124 +303,76 @@ class SelfAttention(nn.Module):
         k = k.to(dtype=k_dtype)
         return q, k
 
-    def forward(self, x: Tensor, attn_bias=None, rope: Tensor = None) -> Tensor:
-        qkv = self.qkv(x)
-        attn_v = self.compute_attention(qkv=qkv, attn_bias=attn_bias, rope=rope)
-        x = self.proj(attn_v)
-        x = self.proj_drop(x)
-        return x
+    def forward(
+        self,
+        x_bnd: Float[Tensor, "batch n d"],
+        rope: Float[Tensor, "2 n_pos d_head"] | None = None,
+    ) -> Float[Tensor, "batch n d"]:
+        b, n_tok, d = x_bnd.shape
+        qkv_b3nd = einops.rearrange(
+            self.qkv(x_bnd),
+            "batch n_tok (parts d) -> batch parts n_tok d",
+            parts=3,  # [q, k, v] = 3 parts
+            d=d,
+        )
+        qkv_b3hnd = einops.rearrange(
+            qkv_b3nd,
+            "batch parts n_tok (n_heads d_head) -> batch parts n_heads n_tok d_head",
+            parts=3,
+            n_heads=self.cfg.num_heads,
+            d_head=d // self.cfg.num_heads,
+        )
+        q_bhnd, k_bhnd, v_bhnd = torch.unbind(qkv_b3hnd, dim=1)
 
-    def forward_list(self, x_list, attn_bias=None, rope_list=None) -> list[Tensor]:
-        assert len(x_list) == len(rope_list)  # should be enforced by the Block
-        x_flat, shapes, num_tokens = cat_keep_shapes(x_list)
-        qkv_flat = self.qkv(x_flat)
-        qkv_list = uncat_with_shapes(qkv_flat, shapes, num_tokens)
-        att_out = []
-        for _, (qkv, _, rope) in enumerate(zip(qkv_list, shapes, rope_list)):
-            att_out.append(self.compute_attention(qkv, attn_bias=attn_bias, rope=rope))
-        x_flat, shapes, num_tokens = cat_keep_shapes(att_out)
-        x_flat = self.proj(x_flat)
-        return uncat_with_shapes(x_flat, shapes, num_tokens)
-
-    def compute_attention(self, qkv: Tensor, attn_bias=None, rope=None) -> Tensor:
-        assert attn_bias is None
-        B, N, _ = qkv.shape
-        C = self.qkv.in_features
-
-        qkv = qkv.reshape(B, N, 3, self.num_heads, C // self.num_heads)
-        q, k, v = torch.unbind(qkv, 2)
-        q, k, v = [t.transpose(1, 2) for t in [q, k, v]]
         if rope is not None:
-            q, k = self.apply_rope(q, k, rope)
-        x = torch.nn.functional.scaled_dot_product_attention(q, k, v)
-        x = x.transpose(1, 2)
-        return x.reshape([B, N, C])
+            q_bhnd, k_bhnd = self.apply_rope(q_bhnd, k_bhnd, rope)
+        x_bhnd = torch.nn.functional.scaled_dot_product_attention(
+            q_bhnd, k_bhnd, v_bhnd
+        )
+        x_bnd = einops.rearrange(
+            x_bhnd, "batch n_heads n_tok d_head -> batch n_tok (n_heads d_head)"
+        )
+        x_bnd = self.proj(x_bnd)
+        return x_bnd
+
+    # def compute_attention(self, qkv: Tensor, rope=None) -> Tensor:
 
 
+@jaxtyped(typechecker=beartype.beartype)
 class Mlp(nn.Module):
     def __init__(
         self,
         in_features: int,
         hidden_features: int | None = None,
         out_features: int | None = None,
-        act_layer: Callable[..., nn.Module] = nn.GELU,
-        drop: float = 0.0,
-        bias: bool = True,
-        device=None,
     ) -> None:
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
-        self.fc1 = nn.Linear(in_features, hidden_features, bias=bias, device=device)
-        self.act = act_layer()
-        self.fc2 = nn.Linear(hidden_features, out_features, bias=bias, device=device)
-        self.drop = nn.Dropout(drop)
+        self.fc1 = nn.Linear(in_features, hidden_features, bias=True)
+        self.fc2 = nn.Linear(hidden_features, out_features, bias=True)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def __call__(self, x: Float[Tensor, "*batch d"]) -> Float[Tensor, "*batch d"]:
         x = self.fc1(x)
-        x = self.act(x)
-        x = self.drop(x)
+        x = F.gelu(x, approximate="none")
         x = self.fc2(x)
-        x = self.drop(x)
         return x
 
 
+@jaxtyped(typechecker=beartype.beartype)
 class SelfAttentionBlock(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        num_heads: int,
-        ffn_ratio: float = 4.0,
-        qkv_bias: bool = False,
-        proj_bias: bool = True,
-        ffn_bias: bool = True,
-        drop: float = 0.0,
-        attn_drop: float = 0.0,
-        init_values=None,
-        drop_path: float = 0.0,
-        act_layer: Callable[..., nn.Module] = nn.GELU,
-        norm_layer: Callable[..., nn.Module] = nn.LayerNorm,
-        attn_class: Callable[..., nn.Module] = SelfAttention,
-        ffn_layer: Callable[..., nn.Module] = Mlp,
-        mask_k_bias: bool = False,
-        device=None,
-    ) -> None:
+    def __init__(self, cfg: Config):
         super().__init__()
-        # print(f"biases: qkv: {qkv_bias}, proj: {proj_bias}, ffn: {ffn_bias}")
-        self.norm1 = norm_layer(dim)
-        self.attn = attn_class(
-            dim,
-            num_heads=num_heads,
-            qkv_bias=qkv_bias,
-            proj_bias=proj_bias,
-            attn_drop=attn_drop,
-            proj_drop=drop,
-            mask_k_bias=mask_k_bias,
-            device=device,
-        )
-        self.ls1 = (
-            LayerScale(dim, init_values=init_values, device=device)
-            if init_values
-            else nn.Identity()
-        )
 
-        self.norm2 = norm_layer(dim)
-        mlp_hidden_dim = int(dim * ffn_ratio)
-        self.mlp = ffn_layer(
-            in_features=dim,
-            hidden_features=mlp_hidden_dim,
-            act_layer=act_layer,
-            drop=drop,
-            bias=ffn_bias,
-            device=device,
-        )
-        self.ls2 = (
-            LayerScale(dim, init_values=init_values, device=device)
-            if init_values
-            else nn.Identity()
-        )
+        self.ls1 = LayerScale(cfg.embed_dim)
+        self.norm1 = _norm_layer_lookup[cfg.norm_layer](cfg.embed_dim)
+        self.norm2 = _norm_layer_lookup[cfg.norm_layer](cfg.embed_dim)
+        self.ls2 = LayerScale(cfg.embed_dim)
 
-        self.sample_drop_ratio = drop_path
+        ffn_hidden_dim = int(cfg.embed_dim * cfg.ffn_ratio)
+        self.mlp = Mlp(cfg.embed_dim, ffn_hidden_dim, cfg.embed_dim)
+
+        self.attn = SelfAttention(cfg)
 
     @staticmethod
     def _maybe_index_rope(
@@ -475,154 +432,51 @@ class SelfAttentionBlock(nn.Module):
             raise AssertionError
 
 
-ffn_layer_dict = {
+_ffn_layer_lookup = {
     "mlp": Mlp,
 }
 
-norm_layer_dict = {
+_norm_layer_lookup = {
     "layernorm": functools.partial(nn.LayerNorm, eps=1e-6),
     "layernormbf16": functools.partial(nn.LayerNorm, eps=1e-5),
 }
 
-dtype_dict = {
+_dtype_lookup = {
     "fp32": torch.float32,
     "fp16": torch.float16,
     "bf16": torch.bfloat16,
 }
 
 
-class DinoVisionTransformer(nn.Module):
-    def __init__(
-        self,
-        *,
-        img_size: int = 224,
-        patch_size: int = 16,
-        in_chans: int = 3,
-        pos_embed_rope_base: float = 100.0,
-        pos_embed_rope_min_period: float | None = None,
-        pos_embed_rope_max_period: float | None = None,
-        pos_embed_rope_normalize_coords: tp.Literal[
-            "min", "max", "separate"
-        ] = "separate",
-        pos_embed_rope_shift_coords: float | None = None,
-        pos_embed_rope_jitter_coords: float | None = None,
-        pos_embed_rope_rescale_coords: float | None = None,
-        pos_embed_rope_dtype: str = "bf16",
-        embed_dim: int = 768,
-        depth: int = 12,
-        num_heads: int = 12,
-        ffn_ratio: float = 4.0,
-        qkv_bias: bool = True,
-        drop_path_rate: float = 0.0,
-        layerscale_init: float | None = None,
-        norm_layer: str = "layernorm",
-        ffn_layer: str = "mlp",
-        ffn_bias: bool = True,
-        proj_bias: bool = True,
-        n_storage_tokens: int = 0,
-        mask_k_bias: bool = False,
-        untie_cls_and_patch_norms: bool = False,
-        untie_global_and_local_cls_norm: bool = False,
-        device: tp.Any | None = None,
-        **ignored_kwargs,
-    ):
+@jaxtyped(typechecker=beartype.beartype)
+class VisionTransformer(nn.Module):
+    def __init__(self, cfg: Config):
         super().__init__()
-        if len(ignored_kwargs) > 0:
-            logger.warning(f"Ignored kwargs: {ignored_kwargs}")
-        del ignored_kwargs
 
-        norm_layer_cls = norm_layer_dict[norm_layer]
+        self.cfg = cfg
 
-        self.num_features = self.embed_dim = (
-            embed_dim  # num_features for consistency with other models
+        self.cls_token = nn.Parameter(torch.empty(1, 1, cfg.embed_dim))
+        self.storage_tokens = nn.Parameter(
+            torch.empty(1, cfg.n_storage_tokens, cfg.embed_dim)
         )
-        self.n_blocks = depth
-        self.num_heads = num_heads
-        self.patch_size = patch_size
+        self.mask_token = nn.Parameter(torch.empty(1, cfg.embed_dim))
 
         self.patch_embed = PatchEmbed(
-            img_size=img_size,
-            patch_size=patch_size,
-            in_chans=in_chans,
-            embed_dim=embed_dim,
-            flatten_embedding=False,
+            cfg.img_size, cfg.patch_size, cfg.in_chans, cfg.embed_dim
         )
-
-        self.cls_token = nn.Parameter(torch.empty(1, 1, embed_dim, device=device))
-        self.n_storage_tokens = n_storage_tokens
-        if self.n_storage_tokens > 0:
-            self.storage_tokens = nn.Parameter(
-                torch.empty(1, n_storage_tokens, embed_dim, device=device)
-            )
-        logger.info(f"using base={pos_embed_rope_base} for rope new")
-        logger.info(f"using min_period={pos_embed_rope_min_period} for rope new")
-        logger.info(f"using max_period={pos_embed_rope_max_period} for rope new")
-        logger.info(
-            f"using normalize_coords={pos_embed_rope_normalize_coords} for rope new"
-        )
-        logger.info(f"using shift_coords={pos_embed_rope_shift_coords} for rope new")
-        logger.info(
-            f"using rescale_coords={pos_embed_rope_rescale_coords} for rope new"
-        )
-        logger.info(f"using jitter_coords={pos_embed_rope_jitter_coords} for rope new")
-        logger.info(f"using dtype={pos_embed_rope_dtype} for rope new")
         self.rope_embed = RopePositionEmbedding(
-            embed_dim=embed_dim,
-            num_heads=num_heads,
-            base=pos_embed_rope_base,
-            min_period=pos_embed_rope_min_period,
-            max_period=pos_embed_rope_max_period,
-            normalize_coords=pos_embed_rope_normalize_coords,
-            shift_coords=pos_embed_rope_shift_coords,
-            jitter_coords=pos_embed_rope_jitter_coords,
-            rescale_coords=pos_embed_rope_rescale_coords,
-            dtype=dtype_dict[pos_embed_rope_dtype],
-            device=device,
+            cfg.embed_dim,
+            num_heads=cfg.num_heads,
+            base=cfg.pos_embed_rope_base,
+            min_period=cfg.pos_embed_rope_min_period,
+            max_period=cfg.pos_embed_rope_max_period,
+            normalize_coords=cfg.pos_embed_rope_normalize_coords,
+            dtype=_dtype_lookup[cfg.pos_embed_rope_dtype],
         )
-        logger.info(f"using {ffn_layer} layer as FFN")
-        ffn_layer_cls = ffn_layer_dict[ffn_layer]
-        ffn_ratio_sequence = [ffn_ratio] * depth
-        blocks_list = [
-            SelfAttentionBlock(
-                dim=embed_dim,
-                num_heads=num_heads,
-                ffn_ratio=ffn_ratio_sequence[i],
-                qkv_bias=qkv_bias,
-                proj_bias=proj_bias,
-                ffn_bias=ffn_bias,
-                drop_path=drop_path_rate,
-                norm_layer=norm_layer_cls,
-                act_layer=nn.GELU,
-                ffn_layer=ffn_layer_cls,
-                init_values=layerscale_init,
-                mask_k_bias=mask_k_bias,
-                device=device,
-            )
-            for i in range(depth)
-        ]
 
-        self.chunked_blocks = False
-        self.blocks = nn.ModuleList(blocks_list)
+        self.blocks = nn.ModuleList([SelfAttentionBlock(cfg) for i in range(cfg.depth)])
 
-        # This norm is applied to everything, or when untying, to patch and mask tokens.
-        self.norm = norm_layer_cls(embed_dim)
-
-        self.untie_cls_and_patch_norms = untie_cls_and_patch_norms
-        if untie_cls_and_patch_norms:
-            # When untying, this norm is applied to CLS tokens and registers.
-            self.cls_norm = norm_layer_cls(embed_dim)
-        else:
-            self.cls_norm = None
-
-        self.untie_global_and_local_cls_norm = untie_global_and_local_cls_norm
-        if untie_global_and_local_cls_norm:
-            # When untying, this norm is applied to local CLS tokens and registers.
-            # This norm is never used during eval.
-            self.local_cls_norm = norm_layer_cls(embed_dim)
-        else:
-            self.local_cls_norm = None
-        self.head = nn.Identity()
-        self.mask_token = nn.Parameter(torch.empty(1, embed_dim, device=device))
+        self.norm = _norm_layer_lookup[cfg.norm_layer](cfg.embed_dim)
 
     def prepare_tokens_with_masks(
         self, x: Tensor, masks=None
@@ -671,7 +525,7 @@ class DinoVisionTransformer(nn.Module):
             rope.append(hw_tuple)
         for _, blk in enumerate(self.blocks):
             if self.rope_embed is not None:
-                rope_sincos = [self.rope_embed(H=H, W=W) for H, W in rope]
+                rope_sincos = [self.rope_embed(h=h, w=w) for h, w in rope]
             else:
                 rope_sincos = [None for r in rope]
             x = blk(x, rope_sincos)
@@ -710,8 +564,182 @@ class DinoVisionTransformer(nn.Module):
         return self.head(ret["x_norm_clstoken"])
 
 
+_PRETRAINED_CFGS = {
+    "dinov3_vits16": Config(
+        img_size=224,
+        patch_size=16,
+        in_chans=3,
+        pos_embed_rope_base=100.0,
+        pos_embed_rope_normalize_coords="separate",
+        pos_embed_rope_rescale_coords=2.0,
+        pos_embed_rope_dtype="fp32",
+        embed_dim=384,
+        depth=12,
+        num_heads=6,
+        ffn_ratio=4.0,
+        qkv_bias=True,
+        drop_path_rate=0.0,
+        layerscale_init=1.0e-05,
+        norm_layer="layernormbf16",
+        ffn_layer="mlp",
+        ffn_bias=True,
+        proj_bias=True,
+        n_storage_tokens=4,
+        mask_k_bias=True,
+    ),
+    "dinov3_vits16plus": Config(
+        img_size=224,
+        patch_size=16,
+        in_chans=3,
+        pos_embed_rope_base=100.0,
+        pos_embed_rope_normalize_coords="separate",
+        pos_embed_rope_rescale_coords=2.0,
+        pos_embed_rope_dtype="fp32",
+        embed_dim=384,
+        depth=12,
+        num_heads=6,
+        ffn_ratio=6.0,
+        qkv_bias=True,
+        drop_path_rate=0.0,
+        layerscale_init=1.0e-05,
+        norm_layer="layernormbf16",
+        ffn_layer="swiglu",
+        ffn_bias=True,
+        proj_bias=True,
+        n_storage_tokens=4,
+        mask_k_bias=True,
+    ),
+    "dinov3_vitb16": Config(
+        img_size=224,
+        patch_size=16,
+        in_chans=3,
+        pos_embed_rope_base=100.0,
+        pos_embed_rope_normalize_coords="separate",
+        pos_embed_rope_rescale_coords=2.0,
+        pos_embed_rope_dtype="fp32",
+        embed_dim=768,
+        depth=12,
+        num_heads=12,
+        ffn_ratio=4.0,
+        qkv_bias=True,
+        drop_path_rate=0.0,
+        layerscale_init=1.0e-05,
+        norm_layer="layernormbf16",
+        ffn_layer="mlp",
+        ffn_bias=True,
+        proj_bias=True,
+        n_storage_tokens=4,
+        mask_k_bias=True,
+    ),
+    "dinov3_vitl16": Config(
+        img_size=224,
+        patch_size=16,
+        in_chans=3,
+        pos_embed_rope_base=100.0,
+        pos_embed_rope_normalize_coords="separate",
+        pos_embed_rope_rescale_coords=2.0,
+        pos_embed_rope_dtype="fp32",
+        embed_dim=1024,
+        depth=24,
+        num_heads=16,
+        ffn_ratio=4.0,
+        qkv_bias=True,
+        drop_path_rate=0.0,
+        layerscale_init=1.0e-05,
+        norm_layer="layernormbf16",
+        ffn_layer="mlp",
+        ffn_bias=True,
+        proj_bias=True,
+        n_storage_tokens=4,
+        mask_k_bias=True,
+        untie_global_and_local_cls_norm=False,
+    ),
+    "dinov3_vitl16plus": Config(
+        img_size=224,
+        patch_size=16,
+        in_chans=3,
+        pos_embed_rope_base=100.0,
+        pos_embed_rope_normalize_coords="separate",
+        pos_embed_rope_rescale_coords=2.0,
+        pos_embed_rope_dtype="fp32",
+        embed_dim=1024,
+        depth=24,
+        num_heads=16,
+        ffn_ratio=6.0,
+        qkv_bias=True,
+        drop_path_rate=0.0,
+        layerscale_init=1.0e-05,
+        norm_layer="layernormbf16",
+        ffn_layer="swiglu",
+        ffn_bias=True,
+        proj_bias=True,
+        n_storage_tokens=4,
+        mask_k_bias=True,
+    ),
+    "dinov3_vith16plus": Config(
+        img_size=224,
+        patch_size=16,
+        in_chans=3,
+        pos_embed_rope_base=100.0,
+        pos_embed_rope_normalize_coords="separate",
+        pos_embed_rope_rescale_coords=2.0,
+        pos_embed_rope_dtype="fp32",
+        embed_dim=1280,
+        depth=32,
+        num_heads=20,
+        ffn_ratio=6.0,
+        qkv_bias=True,
+        drop_path_rate=0.0,
+        layerscale_init=1.0e-05,
+        norm_layer="layernormbf16",
+        ffn_layer="swiglu",
+        ffn_bias=True,
+        proj_bias=True,
+        n_storage_tokens=4,
+        mask_k_bias=True,
+    ),
+    "dinov3_vit7b16": Config(
+        img_size=224,
+        patch_size=16,
+        in_chans=3,
+        pos_embed_rope_base=100.0,
+        pos_embed_rope_normalize_coords="separate",
+        pos_embed_rope_rescale_coords=2.0,
+        pos_embed_rope_dtype="fp32",
+        embed_dim=4096,
+        depth=40,
+        num_heads=32,
+        ffn_ratio=3.0,
+        qkv_bias=False,
+        drop_path_rate=0.4,
+        layerscale_init=1.0e-05,
+        norm_layer="layernormbf16",
+        ffn_layer="swiglu64",
+        ffn_bias=True,
+        proj_bias=True,
+        n_storage_tokens=4,
+        mask_k_bias=True,
+        untie_global_and_local_cls_norm=True,
+    ),
+}
+
+
+@beartype.beartype
+def load(name: str, fpath: str | pathlib.Path, device="cpu") -> VisionTransformer:
+    if name not in _PRETRAINED_CFGS:
+        raise ValueError(f"Name '{name}' not in {list(_PRETRAINED_CFGS)}.")
+    cfg = _PRETRAINED_CFGS[name]
+    state_dict = torch.load(fpath, mmap=True, weights_only=True, map_location="cpu")
+    with torch.device("meta"):
+        model = VisionTransformer(cfg)
+    model.load_state_dict(state_dict, assign=True)
+
+    model = model.to(device)
+    return model
+
+
 def vit_small(patch_size=16, **kwargs):
-    model = DinoVisionTransformer(
+    model = VisionTransformer(
         patch_size=patch_size,
         embed_dim=384,
         depth=12,

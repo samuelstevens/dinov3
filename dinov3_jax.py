@@ -89,7 +89,7 @@ _act_fn_lookup = {"gelu": functools.partial(jax.nn.gelu, approximate=False)}
 
 
 @jaxtyped(typechecker=beartype.beartype)
-def rope_rotate_half(
+def _rotate_half(
     x_hnd: Float[Array, "n_heads n d_head"],
 ) -> Float[Array, "n_heads n d_head"]:
     # x:   [ x0  x1  x2  x3  x4  x5]
@@ -99,7 +99,7 @@ def rope_rotate_half(
 
 
 @jaxtyped(typechecker=beartype.beartype)
-def apply_rope(
+def _rope(
     x: Float[Array, "n_heads n d_head"],
     sin: Float[Array, "n d_head"],
     cos: Float[Array, "n d_head"],
@@ -107,7 +107,7 @@ def apply_rope(
     # x:   [..., D], eg [x0,     x1,   x2,   x3,   x4,   x5]
     # sin: [..., D], eg [sin0, sin1, sin2, sin0, sin1, sin2]
     # cos: [..., D], eg [cos0, cos1, cos2, cos0, cos1, cos2]
-    return (x * cos) + (rope_rotate_half(x) * sin)
+    return (x * cos) + (_rotate_half(x) * sin)
 
 
 @jaxtyped(typechecker=beartype.beartype)
@@ -129,7 +129,7 @@ def rope_fn(
         q_nhd[prefix:], "n_pos n_heads d_head -> n_heads n_pos d_head"
     )
     q_phd = einops.rearrange(
-        apply_rope(q_hpd, sin_pd, cos_pd),
+        _rope(q_hpd, sin_pd, cos_pd),
         "n_heads n_pos d_head -> n_pos n_heads d_head",
     )
     q_nhd = jnp.concatenate((q_prefix_hd, q_phd), axis=0)
@@ -138,7 +138,7 @@ def rope_fn(
         k_nhd[prefix:], "n_pos n_heads d_head -> n_heads n_pos d_head"
     )
     k_phd = einops.rearrange(
-        apply_rope(k_hpd, sin_pd, cos_pd),
+        _rope(k_hpd, sin_pd, cos_pd),
         "n_heads n_pos d_head -> n_pos n_heads d_head",
     )
     k_nhd = jnp.concatenate((k_prefix_hd, k_phd), axis=0)
@@ -358,7 +358,7 @@ class Mlp(eqx.Module):
         return x
 
 
-@beartype.beartype
+@jaxtyped(typechecker=beartype.beartype)
 class SelfAttention(eqx.Module):
     cfg: Config
     scale: float

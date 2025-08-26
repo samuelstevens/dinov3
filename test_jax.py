@@ -27,18 +27,16 @@ def test_load_jax_ckpt(jax_path):
 @pytest.mark.parametrize("h,w", [(2, 2), (4, 4), (16, 16), (8, 12)])
 def test_rope_fwd(h, w, vits):
     vit_ref, vit_eqx = vits
-    rope_pt = vit_ref.rope_embed
-    rope_eqx = vit_eqx.rope_embed
-    out_pt_h, out_pt_w = rope_pt(H=h, W=w)
-    out_eqx_h, out_eqx_w = rope_eqx(h=h, w=w)
+    out_ref_h, out_ref_w = vit_ref.rope_embed(H=h, W=w)
+    out_eqx_h, out_eqx_w = vit_eqx.rope_embed(h=h, w=w)
 
     # Check shape
-    assert out_pt_h.shape == out_eqx_h.shape
-    assert out_pt_w.shape == out_eqx_w.shape
+    assert out_ref_h.shape == out_eqx_h.shape
+    assert out_ref_w.shape == out_eqx_w.shape
 
     # Check values
-    np.testing.assert_allclose(out_pt_h, out_eqx_h, rtol=1e-6, atol=1e-6)
-    np.testing.assert_allclose(out_pt_w, out_eqx_w, rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(out_ref_h, out_eqx_h, rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(out_ref_w, out_eqx_w, rtol=1e-6, atol=1e-6)
 
 
 def test_patch_embed_fwd(vits):
