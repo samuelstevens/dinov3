@@ -92,3 +92,39 @@ def test_self_attn_no_rope_fwd(vits):
 
     # Check values
     np.testing.assert_allclose(out_ref, out_pt, rtol=1e-6, atol=1e-4)
+
+
+def test_mlp_fwd(vits):
+    vit_ref, vit_pt = vits
+    torch.manual_seed(15)
+
+    x_1d = torch.rand((1, vit_pt.cfg.embed_dim))
+
+    # PyTorch forward pass
+    with torch.no_grad():
+        out_pt = vit_pt.blocks[1].mlp(x_1d)
+        out_ref = vit_ref.blocks[1].mlp(x_1d)
+
+    # Check shapes
+    assert out_ref.shape == out_pt.shape
+
+    # Check values
+    np.testing.assert_allclose(out_ref, out_pt, rtol=1e-6, atol=1e-4)
+
+
+def test_vit_fwd(vits):
+    vit_ref, vit_pt = vits
+
+    torch.manual_seed(12)
+    img_bchw = torch.rand((1, 3, 224, 224))
+
+    # Get PT forward pass
+    with torch.no_grad():
+        out_pt = vit_pt(img_bchw)
+        out_ref = vit_ref(img_bchw)
+
+    # Check shape
+    assert out_ref.shape == out_pt.shape
+
+    # Check values
+    np.testing.assert_allclose(out_ref, out_pt, rtol=1e-6, atol=1e-4)
