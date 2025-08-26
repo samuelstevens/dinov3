@@ -1,0 +1,22 @@
+[project]
+name = "dinov3"
+version = "0.1.0"
+description = "Single-file implementations of DINOv3 in Torch and Jax/Equinox"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "beartype>=0.21.0",
+    "chex>=0.1.90",
+    "einops>=0.8.1",
+    "equinox>=0.13.0",
+    "hypothesis>=6.138.3",
+    "jax>=0.7.1",
+    "jaxtyping>=0.3.2",
+    "pytest>=8.4.1",
+    "torch>=2.8.0",
+    "torchvision>=0.23.0",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+ignore = ["F722", "E402", "E501"]
