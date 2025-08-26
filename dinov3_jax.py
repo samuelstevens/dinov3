@@ -70,22 +70,8 @@ class Config:
     """Whether to mask K bias in attention."""
     untie_cls_and_patch_norms: bool = False
     """Whether to use separate norms for CLS and patch tokens."""
-    untie_global_and_local_cls_norm: bool = False
-    """Whether to use separate norms for global and local CLS tokens."""
     device: tp.Any | None = None
     """Device for tensor operations."""
-
-
-_norm_layer_lookup = {
-    "layernorm": functools.partial(eqx.nn.LayerNorm, eps=1e-6),
-    "layernormbf16": functools.partial(eqx.nn.LayerNorm, eps=1e-5),
-}
-
-_dtype_lookup = {
-    "fp32": jnp.dtype("float32"),
-}
-
-_act_fn_lookup = {"gelu": functools.partial(jax.nn.gelu, approximate=False)}
 
 
 @jaxtyped(typechecker=beartype.beartype)
@@ -320,7 +306,34 @@ class LinearKMaskedBias(eqx.nn.Linear):
         return x
 
 
-@beartype.beartype
+@jaxtyped(typechecker=beartype.beartype)
+class SwiGLUFFN(eqx.Module):
+    def __init__(
+        self,
+        in_features: int,
+        hidden_features: int | None,
+        out_features: int | None,
+        act_layer: str,
+        align_to: int,
+        *,
+        key: chex.PRNGKey,
+    ):
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        d = int(hidden_features * 2 / 3)
+        hidden_features = d + (-d % align_to)
+        self.w1 = eqx.nn.Linear(in_features, hidden_features, use_bias=True)
+        self.w2 = eqx.nn.Linear(in_features, hidden_features, use_bias=True)
+        self.w3 = eqx.nn.Linear(hidden_features, out_features, use_bias=True)
+
+    def __call__(self, x: Float[Array, " d"]) -> Float[Array, " d"]:
+        x1 = self.w1(x)
+        x2 = self.w2(x)
+        hidden = jax.nn.silu(x1) * x2
+        return self.w3(hidden)
+
+
+@jaxtyped(typechecker=beartype.beartype)
 class Mlp(eqx.Module):
     in_features: int
     hidden_features: int
@@ -439,6 +452,25 @@ class SelfAttentionBlock(eqx.Module):
         return x_ffn_nd
 
 
+_norm_layer_lookup = {
+    "layernorm": functools.partial(eqx.nn.LayerNorm, eps=1e-6),
+    "layernormbf16": functools.partial(eqx.nn.LayerNorm, eps=1e-5),
+}
+
+_dtype_lookup = {
+    "fp32": jnp.dtype("float32"),
+}
+
+_act_fn_lookup = {
+    "gelu": functools.partial(jax.nn.gelu, approximate=False),
+}
+
+_ffn_layer_lookup = {
+    "mlp": Mlp,
+    "swiglu": SwiGLUFFN,
+}
+
+
 @beartype.beartype
 class VisionTransformer(eqx.Module):
     cfg: Config
@@ -494,12 +526,8 @@ class VisionTransformer(eqx.Module):
         for block in self.blocks:
             x_nd = block(x_nd, rope_2nd)
 
-        if self.cfg.untie_global_and_local_cls_norm:
-            x_cls_reg_nd = x_nd[: self.cfg.n_storage_tokens + 1]
-            x_norm_cls_reg = jax.vmap(self.norm)(x_cls_reg_nd)
-        else:
-            x_norm_nd = jax.vmap(self.norm)(x_nd)
-            x_norm_cls_reg = x_norm_nd[: self.cfg.n_storage_tokens + 1]
+        x_norm_nd = jax.vmap(self.norm)(x_nd)
+        x_norm_cls_reg = x_norm_nd[: self.cfg.n_storage_tokens + 1]
 
         return x_norm_cls_reg[0]
 
@@ -609,7 +637,6 @@ _PRETRAINED_CFGS = {
         proj_bias=True,
         n_storage_tokens=4,
         mask_k_bias=True,
-        untie_global_and_local_cls_norm=False,
     ),
     "dinov3_vitl16plus": Config(
         img_size=224,
@@ -676,14 +703,13 @@ _PRETRAINED_CFGS = {
         proj_bias=True,
         n_storage_tokens=4,
         mask_k_bias=True,
-        untie_global_and_local_cls_norm=True,
     ),
 }
 
 
 @beartype.beartype
-def _parse_name_pt(dinov3_ckpt: pathlib.Path) -> str:
-    name_ds, sha = dinov3_ckpt.stem.split("-")
+def _parse_name_pt(ckpt: pathlib.Path) -> str:
+    name_ds, sha = ckpt.stem.split("-")
     *name, pretrain, ds = name_ds.split("_")
     assert pretrain == "pretrain"
     return "_".join(name)
@@ -769,25 +795,25 @@ def _coerce_to_jax(
 
 
 @beartype.beartype
-def _convert(dinov3_ckpt: pathlib.Path, dump_to: pathlib.Path):
+def _convert(ckpt: pathlib.Path, dump_to: pathlib.Path):
     """Convert DINOv3 checkpoints from PyTorch to Jax/Equinox.
 
     Run with `uv run --with torch src/btx/modeling/dinov3.py` to include torch.
 
     Args:
-        dinov3_ckpt: The specific .pth checkpoint you want to convert.
+        ckpt: The specific .pth checkpoint you want to convert.
         dump_to: Where to save the .eqx checkpoint file.
     """
     import tempfile
 
     import torch
 
-    name = _parse_name_pt(dinov3_ckpt)
+    name = _parse_name_pt(ckpt)
     if name not in _PRETRAINED_CFGS:
         raise ValueError(f"Name '{name}' not in {list(_PRETRAINED_CFGS)}.")
 
     vit_pt = torch.hub.load(
-        "facebookresearch/dinov3", name, source="github", weights=str(dinov3_ckpt)
+        "facebookresearch/dinov3", name, source="github", weights=str(ckpt)
     )
     cfg = _PRETRAINED_CFGS[name]
     vit_eqx = VisionTransformer(cfg, key=jax.random.key(seed=0))
