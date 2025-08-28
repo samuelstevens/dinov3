@@ -1,5 +1,7 @@
 # DINOv3
 
+> Copy-paste the dinov3_pt.py or dinov_jax.py file to YOURPROJECT/dinov3.py and hack as necessary.
+
 DINOv3 seems to be a great model.
 
 You can download the models if you share your contact info with Meta.
@@ -8,7 +10,10 @@ For instance, this loads the ViT-B/16.
 
 ```py
 vit = torch.hub.load(
-    "facebookresearch/dinov3", "dinov3_vitb16", source="github", weights="/PATH/TO/MODELS/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth"
+    "facebookresearch/dinov3",
+    "dinov3_vitb16",
+    source="github",
+    weights="/PATH/TO/MODELS/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth",
 )
 ```
 
@@ -18,12 +23,14 @@ If you want to do more stuff, you will have to hack at the model code.
 To make this easier, I have two single-file implemenations of DINOv3, in both PyTorch and Jax/Equinox.
 I have compared outputs against the reference implementation and they are identical for the [CLS] token up to floating-point errors for ViT-S/16, ViT-B/16 and ViT-L/16.
 
+**Copy-paste the dinov3_pt.py or dinov_jax.py file to YOURPROJECT/dinov3.py and hack as necessary.**
+
 # PyTorch
 
 After downloading the checkpoints to a directory $CKPTS, you can use `dinov3_pt.load()`
 
 ```py
-
+vit = dinov3_pt.load("dinov3_vitb16", "/PATH/TO/MODELS/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth")
 ```
 
 # Jax

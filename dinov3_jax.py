@@ -434,10 +434,11 @@ class SelfAttentionBlock(eqx.Module):
     def __init__(self, cfg: Config, key: chex.PRNGKey):
         self.cfg = cfg
         k1, k2, k3, k4 = jax.random.split(key, 4)
-        self.ls1 = LayerScale(cfg.embed_dim, key=k1)
         self.norm1 = _norm_layer_lookup[cfg.norm_layer](cfg.embed_dim)
-        self.norm2 = _norm_layer_lookup[cfg.norm_layer](cfg.embed_dim)
         self.attn = SelfAttention(cfg, key=k2)
+        self.ls1 = LayerScale(cfg.embed_dim, key=k1)
+
+        self.norm2 = _norm_layer_lookup[cfg.norm_layer](cfg.embed_dim)
         ffn_hidden_dim = int(cfg.embed_dim * cfg.ffn_ratio)
         self.mlp = Mlp(cfg.embed_dim, ffn_hidden_dim, cfg.embed_dim, "gelu", key=k3)
         self.ls2 = LayerScale(cfg.embed_dim, key=k4)
@@ -445,11 +446,9 @@ class SelfAttentionBlock(eqx.Module):
     def __call__(
         self, x_nd: Float[Array, "n d"], rope: Float[Array, "2 n_pos d_head"]
     ) -> Float[Array, "n d"]:
-        x_attn_nd = x_nd + self.ls1(self.attn(jax.vmap(self.norm1)(x_nd), rope=rope))
-        x_ffn_nd = x_attn_nd + self.ls2(
-            jax.vmap(self.mlp)(jax.vmap(self.norm2)(x_attn_nd))
-        )
-        return x_ffn_nd
+        x_nd = x_nd + self.ls1(self.attn(jax.vmap(self.norm1)(x_nd), rope=rope))
+        x_nd = x_nd + self.ls2(jax.vmap(self.mlp)(jax.vmap(self.norm2)(x_nd)))
+        return x_nd
 
 
 _norm_layer_lookup = {
