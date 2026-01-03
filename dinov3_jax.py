@@ -181,7 +181,7 @@ class PatchEmbed(eqx.Module):
         x_dhw = self.proj(x_chw)
         _, h, w = x_dhw.shape
         x_nd = einops.rearrange(x_dhw, "d h w -> (h w) d")
-        x = einops.rearrange(x_nd, "(h w) d -> h w d", h=h, w=h)
+        x = einops.rearrange(x_nd, "(h w) d -> h w d", h=h, w=w)
         return x
 
 
